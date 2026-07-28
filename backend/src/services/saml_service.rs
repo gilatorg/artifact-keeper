@@ -654,8 +654,16 @@ impl SamlService {
             sp_entity_id = self.config.sp_entity_id,
         );
 
-        // Base64 encode and URL encode the request
-        let encoded_request = base64_encode(authn_request.as_bytes());
+        // DEFLATE, then base64, then URL-encode.
+        //
+        // The HTTP-Redirect binding (SAML 2.0 bindings §3.4.4.1) carries the
+        // message in a URL parameter, so it mandates raw DEFLATE (RFC 1951 —
+        // no zlib or gzip wrapper) before base64. Emitting base64 of the raw
+        // XML makes strict IdPs reject the sign-in outright; Microsoft Entra
+        // answers with `AADSTS750055: SAML message was not properly
+        // DEFLATE-encoded`.
+        let deflated = deflate_authn_request(authn_request.as_bytes())?;
+        let encoded_request = base64_encode(&deflated);
         let url_encoded_request = urlencoding::encode(&encoded_request);
         let url_encoded_relay_state = urlencoding::encode(&relay_state);
 
@@ -1195,6 +1203,26 @@ impl SamlService {
     }
 }
 
+/// Raw-DEFLATE an AuthnRequest for the SAML HTTP-Redirect binding.
+///
+/// SAML 2.0 bindings §3.4.4.1 requires the message be compressed with raw
+/// DEFLATE (RFC 1951) — deliberately *without* the zlib (RFC 1950) or gzip
+/// (RFC 1952) framing. `flate2::write::DeflateEncoder` is the raw variant;
+/// `ZlibEncoder`/`GzEncoder` would add a header and be rejected just as an
+/// uncompressed payload is.
+fn deflate_authn_request(input: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(input)
+        .map_err(|e| AppError::Internal(format!("Failed to DEFLATE SAML AuthnRequest: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| AppError::Internal(format!("Failed to DEFLATE SAML AuthnRequest: {e}")))
+}
+
 /// Base64 encode bytes
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1559,6 +1587,81 @@ mod tests {
             PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
             config,
         )
+    }
+
+    /// AADSTS750055 regression: the HTTP-Redirect binding requires the
+    /// AuthnRequest be raw-DEFLATE compressed (RFC 1951) before base64.
+    /// Emitting base64 of the uncompressed XML made Microsoft Entra reject
+    /// sign-in with "SAML message was not properly DEFLATE-encoded".
+    ///
+    /// Round-trips the emitted `SAMLRequest` the way an IdP does — URL-decode,
+    /// base64-decode, raw-inflate — and asserts the original XML comes back.
+    /// A raw inflater cannot read zlib/gzip-framed output, so this also pins
+    /// that the encoder stays the raw variant.
+    #[test]
+    fn test_authn_request_is_raw_deflate_encoded() {
+        use std::io::Read;
+
+        let service = make_test_saml_service();
+        let req = service
+            .create_authn_request()
+            .expect("AuthnRequest generation must succeed");
+
+        let query = req
+            .redirect_url
+            .split_once("?SAMLRequest=")
+            .expect("redirect URL carries a SAMLRequest parameter")
+            .1;
+        let saml_request = query
+            .split_once("&RelayState=")
+            .expect("redirect URL carries a RelayState parameter")
+            .0;
+
+        let url_decoded = urlencoding::decode(saml_request).expect("SAMLRequest is URL-encoded");
+        let compressed = base64_decode(&url_decoded).expect("SAMLRequest is base64");
+
+        // The payload must actually be compressed, not base64 of raw XML.
+        assert!(
+            !compressed.starts_with(b"<?xml"),
+            "SAMLRequest must not be base64 of uncompressed XML (AADSTS750055)"
+        );
+
+        let mut xml = String::new();
+        flate2::read::DeflateDecoder::new(&compressed[..])
+            .read_to_string(&mut xml)
+            .expect("SAMLRequest must be raw DEFLATE (no zlib/gzip framing)");
+
+        assert!(xml.contains("<samlp:AuthnRequest"), "inflates to the request");
+        assert!(
+            xml.contains(&format!("ID=\"{}\"", req.request_id)),
+            "inflated request carries the issued request id"
+        );
+        assert!(
+            xml.contains("artifact-keeper"),
+            "inflated request carries the SP entity id"
+        );
+    }
+
+    /// The helper must emit raw DEFLATE, not zlib. A zlib stream begins with a
+    /// 0x78 CMF byte; raw DEFLATE never does for these inputs.
+    #[test]
+    fn test_deflate_authn_request_is_not_zlib_framed() {
+        use std::io::Read;
+
+        let payload = b"<?xml version=\"1.0\"?><samlp:AuthnRequest/>";
+        let out = deflate_authn_request(payload).expect("deflate succeeds");
+
+        assert_ne!(
+            out.first(),
+            Some(&0x78),
+            "raw DEFLATE must not carry a zlib header"
+        );
+
+        let mut back = Vec::new();
+        flate2::read::DeflateDecoder::new(&out[..])
+            .read_to_end(&mut back)
+            .expect("round-trips through a raw inflater");
+        assert_eq!(back, payload);
     }
 
     fn sample_saml_response_xml() -> String {
