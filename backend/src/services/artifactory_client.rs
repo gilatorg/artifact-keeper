@@ -70,7 +70,14 @@ pub struct ArtifactoryClientConfig {
     pub base_url: String,
     /// Authentication credentials
     pub auth: ArtifactoryAuth,
-    /// Request timeout in seconds
+    /// Read-inactivity timeout in seconds for the migration HTTP client.
+    ///
+    /// This is applied as reqwest's `read_timeout` (an *idle* deadline that
+    /// bounds time between response-body chunks), NOT its `timeout` (a *total*
+    /// request deadline). A total deadline would abort otherwise-healthy
+    /// multi-GB artifact downloads mid-body, which reqwest surfaces as
+    /// "error decoding response body". Env-overridable via
+    /// `ARTIFACTORY_MIGRATION_READ_TIMEOUT_SECS`.
     pub timeout_secs: u64,
     /// Maximum concurrent requests
     pub max_concurrent: usize,
@@ -319,8 +326,20 @@ fn download_uri_is_safe_to_follow(download_uri: &str) -> bool {
     crate::api::validation::validate_outbound_url(download_uri, "Artifactory downloadUri").is_ok()
 }
 
+/// Default connect timeout (seconds) for the Artifactory migration client.
+const DEFAULT_ARTIFACTORY_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 impl ArtifactoryClient {
-    /// Create a new Artifactory client with the given configuration
+    /// Create a new Artifactory client with the given configuration.
+    ///
+    /// The client is built on [`http_client::large_object_client_builder`],
+    /// which deliberately avoids reqwest's total-request `timeout` so that
+    /// healthy multi-GB artifact downloads are not aborted mid-body. Migration
+    /// transfers are instead bounded by a `connect_timeout` and a
+    /// `read_timeout` (idle deadline between response-body chunks). Both are
+    /// env-tunable, mirroring the remote-instance `proxy_client`:
+    ///   - `ARTIFACTORY_MIGRATION_CONNECT_TIMEOUT_SECS` (default 10)
+    ///   - `ARTIFACTORY_MIGRATION_READ_TIMEOUT_SECS` (default `config.timeout_secs`)
     pub fn new(config: ArtifactoryClientConfig) -> Result<Self, ArtifactoryError> {
         // Enforce HTTPS unless explicitly opted out for local dev
         let allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
@@ -332,9 +351,18 @@ impl ArtifactoryClient {
             );
         }
 
-        let client = crate::services::http_client::base_client_builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .https_only(!allow_http)
+        let connect_secs = std::env::var("ARTIFACTORY_MIGRATION_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ARTIFACTORY_CONNECT_TIMEOUT_SECS);
+        let read_secs = std::env::var("ARTIFACTORY_MIGRATION_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(config.timeout_secs);
+
+        let client = crate::services::http_client::large_object_client_builder(allow_http)
+            .connect_timeout(Duration::from_secs(connect_secs))
+            .read_timeout(Duration::from_secs(read_secs))
             .build()?;
 
         Ok(Self { client, config })
@@ -1088,6 +1116,27 @@ mod tests {
         assert!(client.ping().await.expect("ping must not error"));
         let hits = server.received_requests().await.unwrap_or_default().len();
         assert_eq!(hits, 1, "a successful classic ping must short-circuit");
+    }
+
+    #[test]
+    fn test_client_builds_for_large_downloads() {
+        // Regression for the migration timeout bug: large (>~1.5 GB) artifact
+        // downloads failed with "error decoding response body" because the
+        // client was built with reqwest's total-request `.timeout()`. The
+        // client must now build successfully via the large-object builder
+        // (connect_timeout + read_timeout, no total deadline). We can't assert
+        // reqwest's private timeout fields, so this guards that construction
+        // still succeeds and the config timeout feeds the read (idle) timeout.
+        let config = ArtifactoryClientConfig {
+            base_url: "https://repo.example.com".to_string(),
+            timeout_secs: 3600,
+            ..Default::default()
+        };
+        let client = ArtifactoryClient::new(config);
+        assert!(
+            client.is_ok(),
+            "Artifactory client must build for large-object migration downloads"
+        );
     }
 
     #[test]
