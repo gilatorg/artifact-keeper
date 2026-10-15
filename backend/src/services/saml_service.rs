@@ -1706,7 +1706,7 @@ mod tests {
             .expect("redirect URL carries a RelayState parameter")
             .0;
 
-        let url_decoded = urlencoding::decode(saml_request).expect("SAMLRequest is URL-encoded");
+        let url_decoded = ::urlencoding::decode(saml_request).expect("SAMLRequest is URL-encoded");
         let compressed = base64_decode(&url_decoded).expect("SAMLRequest is base64");
 
         // The payload must actually be compressed, not base64 of raw XML.
@@ -1720,7 +1720,10 @@ mod tests {
             .read_to_string(&mut xml)
             .expect("SAMLRequest must be raw DEFLATE (no zlib/gzip framing)");
 
-        assert!(xml.contains("<samlp:AuthnRequest"), "inflates to the request");
+        assert!(
+            xml.contains("<samlp:AuthnRequest"),
+            "inflates to the request"
+        );
         assert!(
             xml.contains(&format!("ID=\"{}\"", req.request_id)),
             "inflated request carries the issued request id"
