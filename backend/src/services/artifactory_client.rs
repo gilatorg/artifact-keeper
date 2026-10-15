@@ -326,6 +326,38 @@ fn download_uri_is_safe_to_follow(download_uri: &str) -> bool {
     crate::api::validation::validate_outbound_url(download_uri, "Artifactory downloadUri").is_ok()
 }
 
+/// Build the paged AQL listing of a repository's files, optionally limited
+/// to a `modified` window.
+///
+/// The `.sort()` is what makes offset paging sound: without it AQL gives no
+/// order guarantee between requests, so rows pushed or deleted while a
+/// migration walks the listing can shift across a page boundary and be
+/// skipped without trace. JFrog requires `.sort()` before `.offset()`.
+pub(crate) fn build_list_artifacts_aql(
+    repo_key: &str,
+    offset: i64,
+    limit: i64,
+    modified_after: Option<&str>,
+    modified_before: Option<&str>,
+) -> String {
+    let mut conditions = vec![format!(r#""repo": "{}""#, repo_key)];
+
+    if let Some(after) = modified_after {
+        conditions.push(format!(r#""modified": {{"$gt": "{}"}}"#, after));
+    }
+
+    if let Some(before) = modified_before {
+        conditions.push(format!(r#""modified": {{"$lt": "{}"}}"#, before));
+    }
+
+    format!(
+        r#"items.find({{{},"type":"file"}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").sort({{"$asc": ["repo", "path", "name"]}}).offset({}).limit({})"#,
+        conditions.join(", "),
+        offset,
+        limit
+    )
+}
+
 /// Default connect timeout (seconds) for the Artifactory migration client.
 const DEFAULT_ARTIFACTORY_CONNECT_TIMEOUT_SECS: u64 = 10;
 
@@ -617,11 +649,8 @@ impl ArtifactoryClient {
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        let query = format!(
-            r#"items.find({{"repo": "{}","type":"file"}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").offset({}).limit({})"#,
-            repo_key, offset, limit
-        );
-        self.search_aql(&query).await
+        self.list_artifacts_with_date_filter_impl(repo_key, offset, limit, None, None)
+            .await
     }
 
     /// List artifacts in a repository with date range filtering.
@@ -639,22 +668,8 @@ impl ArtifactoryClient {
         modified_after: Option<&str>,
         modified_before: Option<&str>,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        let mut conditions = vec![format!(r#""repo": "{}""#, repo_key)];
-
-        if let Some(after) = modified_after {
-            conditions.push(format!(r#""modified": {{"$gt": "{}"}}"#, after));
-        }
-
-        if let Some(before) = modified_before {
-            conditions.push(format!(r#""modified": {{"$lt": "{}"}}"#, before));
-        }
-
-        let query = format!(
-            r#"items.find({{{},"type":"file"}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").offset({}).limit({})"#,
-            conditions.join(", "),
-            offset,
-            limit
-        );
+        let query =
+            build_list_artifacts_aql(repo_key, offset, limit, modified_after, modified_before);
         self.search_aql(&query).await
     }
 
@@ -1631,6 +1646,30 @@ mod tests {
         };
         let json = serde_json::to_string(&query).unwrap();
         assert!(json.contains("items.find"));
+    }
+
+    #[test]
+    fn test_list_artifacts_aql_is_sorted_before_paging() {
+        let query = build_list_artifacts_aql("docker-local", 2000, 1000, None, None);
+        assert_eq!(
+            query,
+            r#"items.find({"repo": "docker-local","type":"file"}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").sort({"$asc": ["repo", "path", "name"]}).offset(2000).limit(1000)"#
+        );
+    }
+
+    #[test]
+    fn test_list_artifacts_aql_with_date_window() {
+        let query = build_list_artifacts_aql(
+            "docker-local",
+            0,
+            500,
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-02-01T00:00:00Z"),
+        );
+        assert_eq!(
+            query,
+            r#"items.find({"repo": "docker-local", "modified": {"$gt": "2026-01-01T00:00:00Z"}, "modified": {"$lt": "2026-02-01T00:00:00Z"},"type":"file"}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").sort({"$asc": ["repo", "path", "name"]}).offset(0).limit(500)"#
+        );
     }
 
     #[test]
