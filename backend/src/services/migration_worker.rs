@@ -109,16 +109,18 @@ pub(crate) const MAX_ARTIFACT_PAGES: usize = 100_000;
 /// in the current page (not the overall result set), so the termination
 /// decision must be based on page shape, not on a running total.
 ///
+/// Only an empty page ends the listing. A short page is not proof of the
+/// end: Artifactory returned 999 rows for a `limit(1000)` first page of a
+/// repository with far more files behind it, and stopping there left the
+/// rest of the repository unlisted, so its tags were never migrated and no
+/// item was ever recorded as failed or skipped. The cost is one extra,
+/// empty request per repository. The Nexus client serves that request from
+/// its exhausted cursor without an HTTP call.
+///
 /// Returns `true` when the caller should fetch the next page, `false` when
 /// the enumeration is complete.
-pub(crate) fn should_fetch_next_page(page_len: usize, limit: i64) -> bool {
-    if page_len == 0 {
-        return false;
-    }
-    // A short page means we've reached the end of the result set. AQL always
-    // fills pages up to the requested limit unless there are no more rows.
-    let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-    page_len >= limit_usize
+pub(crate) fn should_fetch_next_page(page_len: usize) -> bool {
+    page_len > 0
 }
 
 /// Whether a resolved destination repository should have its member artifacts
@@ -1277,9 +1279,9 @@ impl MigrationWorker {
             // Advance the cursor. AQL's `range.total` reports the count of
             // rows in the current page (matching `end_pos - start_pos`), so
             // termination must be decided from the page shape, not from a
-            // running total. A short page (fewer rows than `limit`) means
-            // the result set is exhausted.
-            if !should_fetch_next_page(page_len, limit) {
+            // running total. Only an empty page means the result set is
+            // exhausted; see `should_fetch_next_page`.
+            if !should_fetch_next_page(page_len) {
                 break;
             }
 
@@ -4649,52 +4651,21 @@ mod tests {
 
     #[test]
     fn test_should_fetch_next_page_full_page_continues() {
-        // A full page (page_len == limit) means more rows are likely available
-        assert!(should_fetch_next_page(1000, 1000));
-        assert!(should_fetch_next_page(100, 100));
+        assert!(should_fetch_next_page(1000));
+        assert!(should_fetch_next_page(1));
     }
 
     #[test]
-    fn test_should_fetch_next_page_short_page_terminates() {
-        // A short page (page_len < limit) means the result set is exhausted
-        assert!(!should_fetch_next_page(42, 1000));
-        assert!(!should_fetch_next_page(999, 1000));
+    fn test_should_fetch_next_page_short_page_continues() {
+        // A short page is NOT the end: Artifactory returned 999 rows for a
+        // limit(1000) first page with more rows behind it.
+        assert!(should_fetch_next_page(999));
+        assert!(should_fetch_next_page(42));
     }
 
     #[test]
     fn test_should_fetch_next_page_empty_terminates() {
-        // An empty page always terminates
-        assert!(!should_fetch_next_page(0, 1000));
-        assert!(!should_fetch_next_page(0, 1));
-    }
-
-    #[test]
-    fn test_should_fetch_next_page_negative_limit_handled() {
-        // Defensive: negative or zero limits should not panic
-        assert!(!should_fetch_next_page(0, -1));
-        assert!(should_fetch_next_page(5, -1));
-    }
-
-    #[test]
-    fn test_should_fetch_next_page_boundary_limit_of_one() {
-        // A single-row page with limit=1 means more rows could exist
-        assert!(should_fetch_next_page(1, 1));
-        // Zero rows with limit=1 means empty result set
-        assert!(!should_fetch_next_page(0, 1));
-    }
-
-    #[test]
-    fn test_should_fetch_next_page_limit_zero_always_continues() {
-        // Zero limit collapses to max usize so any non-empty page continues
-        assert!(should_fetch_next_page(1, 0));
-        assert!(!should_fetch_next_page(0, 0));
-    }
-
-    #[test]
-    fn test_should_fetch_next_page_page_larger_than_limit() {
-        // Defensive: if the server returns more rows than requested,
-        // treat it as a full page (continue fetching)
-        assert!(should_fetch_next_page(200, 100));
+        assert!(!should_fetch_next_page(0));
     }
 
     // -----------------------------------------------------------------------
@@ -6925,10 +6896,11 @@ mod tests {
                 offset: i64,
                 limit: i64,
             ) -> Result<AqlResponse, ArtifactoryError> {
-                // One short page ends pagination; reads must use the SOURCE key.
+                // One artifact, then an empty page ends pagination; reads
+                // must use the SOURCE key.
                 assert_eq!(repo_key, "dry-src", "source must be read by source key");
-                Ok(AqlResponse {
-                    results: vec![AqlResult {
+                let results = if offset == 0 {
+                    vec![AqlResult {
                         repo: repo_key.to_string(),
                         path: "pkg/1.0".into(),
                         name: "thing.tar.gz".into(),
@@ -6937,7 +6909,12 @@ mod tests {
                         modified: None,
                         sha256: None,
                         actual_sha1: None,
-                    }],
+                    }]
+                } else {
+                    vec![]
+                };
+                Ok(AqlResponse {
+                    results,
                     range: AqlRange {
                         start_pos: offset,
                         end_pos: offset + limit,

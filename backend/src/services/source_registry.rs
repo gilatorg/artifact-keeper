@@ -136,8 +136,10 @@ pub struct ArtifactCount {
 /// `range.total` and the Nexus client's `range.total` both describe the page
 /// just returned. Reading `range.total` from a one-row page — what the
 /// assessment used to do — therefore reported every repository as holding at
-/// most one artifact (#3928). Counting rows until a short page is the only
-/// figure either source can back.
+/// most one artifact (#3928). Counting rows until an empty page is the only
+/// figure either source can back: a short page is not the end, because
+/// Artifactory can return 999 rows for a `limit(1000)` page with more rows
+/// behind it (see `migration_worker::should_fetch_next_page`).
 pub async fn count_by_listing<S: SourceRegistry + ?Sized>(
     source: &S,
     repo_key: &str,
@@ -146,16 +148,23 @@ pub async fn count_by_listing<S: SourceRegistry + ?Sized>(
 ) -> Result<ArtifactCount, ArtifactoryError> {
     let page_size = page_size.max(1);
     let mut counted: i64 = 0;
-    for _ in 0..page_budget {
+    let mut pages: usize = 0;
+    let mut last_page_short = false;
+    // When the budget runs out on a short page, one more request settles
+    // whether it was the end, so a repository that fits within the budget is
+    // still counted exactly.
+    while pages < page_budget || (last_page_short && pages == page_budget) {
         let page = source.list_artifacts(repo_key, counted, page_size).await?;
         let page_len = page.results.len() as i64;
-        counted = counted.saturating_add(page_len);
-        if page_len < page_size {
+        if page_len == 0 {
             return Ok(ArtifactCount {
                 counted,
                 exact: true,
             });
         }
+        counted = counted.saturating_add(page_len);
+        pages += 1;
+        last_page_short = page_len < page_size;
     }
     Ok(ArtifactCount {
         counted,
@@ -392,13 +401,22 @@ mod tests {
     /// the size of the repository (#3928).
     struct ListingSource {
         total: i64,
+        /// Most rows one page returns, whatever the requested limit: models
+        /// Artifactory answering 999 rows to a `limit(1000)` page with more
+        /// rows behind it.
+        max_page: i64,
         calls: std::sync::atomic::AtomicUsize,
     }
 
     impl ListingSource {
         fn new(total: i64) -> Self {
+            Self::with_max_page(total, i64::MAX)
+        }
+
+        fn with_max_page(total: i64, max_page: i64) -> Self {
             Self {
                 total,
+                max_page,
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
@@ -422,7 +440,9 @@ mod tests {
             limit: i64,
         ) -> Result<AqlResponse, ArtifactoryError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let end = (offset + limit).min(self.total).max(offset);
+            let end = (offset + limit.min(self.max_page))
+                .min(self.total)
+                .max(offset);
             let results: Vec<_> = (offset..end)
                 .map(|i| crate::services::artifactory_client::AqlResult {
                     repo: repo_key.to_string(),
@@ -504,6 +524,42 @@ mod tests {
                 counted: 0,
                 exact: true
             }
+        );
+    }
+
+    /// A short page is not the end: a source that answers 999 rows to every
+    /// `limit(1000)` page is still counted in full.
+    #[tokio::test]
+    async fn test_count_artifacts_keeps_walking_past_a_short_page() {
+        let source = ListingSource::with_max_page(2_500, COUNT_PAGE_SIZE - 1);
+        let count = source.count_artifacts("repo").await.unwrap();
+        assert_eq!(
+            count,
+            ArtifactCount {
+                counted: 2_500,
+                exact: true
+            }
+        );
+    }
+
+    /// When the budget runs out on a short page, one more request settles
+    /// whether it was the end, so a repository that fits the budget is still
+    /// counted exactly.
+    #[tokio::test]
+    async fn test_count_artifacts_settles_a_short_last_page_past_the_budget() {
+        let total = COUNT_PAGE_SIZE * COUNT_PAGE_BUDGET as i64 - 1;
+        let source = ListingSource::new(total);
+        let count = source.count_artifacts("repo").await.unwrap();
+        assert_eq!(
+            count,
+            ArtifactCount {
+                counted: total,
+                exact: true
+            }
+        );
+        assert_eq!(
+            source.calls.load(std::sync::atomic::Ordering::SeqCst),
+            COUNT_PAGE_BUDGET + 1
         );
     }
 

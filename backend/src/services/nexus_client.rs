@@ -1980,8 +1980,10 @@ mod tests {
                 .expect("list a page");
             let page_len = page.results.len();
             seen.extend(page.results.into_iter().map(|r| r.name));
-            // The worker's own termination rule: a short page ends the walk.
-            if page_len < limit as usize {
+            // The worker's own termination rule: only an empty page ends the
+            // walk. The client answers it from its exhausted cursor, so it
+            // costs no upstream request.
+            if !crate::services::migration_worker::should_fetch_next_page(page_len) {
                 break;
             }
             offset += page_len as i64;

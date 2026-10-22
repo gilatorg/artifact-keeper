@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#2]
+---
+- **An Artifactory migration no longer stops listing a repository after a page shorter than the requested limit** (#2). The worker requested `limit(1000)` and treated any shorter page as the end of the result set, but Artifactory can answer 999 rows with more behind them: a repository's migration discovered exactly 999 items on every run, and the rest of its artifacts were never listed, migrated, or recorded as failed or skipped. Only an empty page now ends the listing, at the cost of one extra request per repository (the Nexus client answers it from its exhausted cursor without an upstream call). The listing AQL now sorts by repository, path and name before `.offset()`, so files pushed or deleted during a run can no longer shift across a page boundary and be skipped. The source assessment's `count_by_listing` follows the same rule, so it no longer reports such a repository as exactly 999 artifacts; when its page budget runs out on a short page it makes one more request to settle the count.
